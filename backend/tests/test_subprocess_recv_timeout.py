@@ -90,6 +90,68 @@ def test_no_registered_sidecar_undercuts_the_accelerated_job_budget():
     )
 
 
+# ── a constant is not enough: the budget scales with the text (#2109 review) ─
+
+
+class _SilentBackend(SubprocessBackend):
+    """A sidecar that expresses no opinion — the shape all four regressions had."""
+    id = "silent"
+
+    @classmethod
+    def is_available(cls):
+        return True, "ok"
+
+    @property
+    def sample_rate(self):
+        return 24000
+
+    @property
+    def supported_languages(self):
+        return ["multi"]
+
+
+class _OpinionatedBackend(_SilentBackend):
+    """A sidecar that deliberately opts *down*, which #2103 asks to keep working."""
+    id = "opinionated"
+    recv_timeout_s = 45.0
+
+
+def test_a_long_passage_raises_the_deadline_past_the_flat_default():
+    # generate_timeout_s adds 1s per 40 characters past a 1200-char allowance,
+    # so a long passage is granted more than the flat floor. A constant deadline
+    # would not move with it and would cut off a job still inside its budget --
+    # the same bug as #2103, just at a longer input.
+    backend = _SilentBackend()
+    short = backend._effective_recv_timeout_s("hello")
+    long_text = "x" * 200_000
+    long_deadline = backend._effective_recv_timeout_s(long_text)
+
+    assert short == GENERATE_RECV_TIMEOUT_S
+    assert long_deadline > short
+    # And it tracks the budget itself, not some second guess at it.
+    from services.model_manager import generate_timeout_s
+    assert long_deadline >= generate_timeout_s(long_text, engine=backend)
+
+
+def test_an_engine_that_opts_down_keeps_its_own_deadline():
+    # "invert the default so the class value is generous and fast engines opt
+    # down" (#2103). An override is a statement about that model, so deriving
+    # from the budget must not quietly overrule it in either direction.
+    backend = _OpinionatedBackend()
+    assert backend._effective_recv_timeout_s("hello") == 45.0
+    assert backend._effective_recv_timeout_s("x" * 200_000) == 45.0
+
+
+def test_budget_probe_failure_falls_back_instead_of_failing_the_generate(monkeypatch):
+    import services.model_manager as mm
+
+    def _boom(*a, **kw):
+        raise RuntimeError("device probe unavailable")
+
+    monkeypatch.setattr(mm, "generate_timeout_s", _boom)
+    assert _SilentBackend()._effective_recv_timeout_s("hello") == GENERATE_RECV_TIMEOUT_S
+
+
 # ── the deadline has to appear in the error the caller sees (#2103) ─────────
 
 # Wedges on the first synthesize, so the parent's watchdog is the only thing
